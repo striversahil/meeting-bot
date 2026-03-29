@@ -4,6 +4,8 @@ import path from 'path';
 import axios from 'axios';
 import FormData from 'form-data';
 import * as chromiumModule from './lib/chromium';
+import * as promiseModule from './lib/promise';
+import { spawn } from 'child_process';
 import { GoogleMeetBot } from './bots/GoogleMeetBot';
 import { MicrosoftTeamsBot } from './bots/MicrosoftTeamsBot';
 import { ZoomBot } from './bots/ZoomBot';
@@ -14,276 +16,206 @@ import { encodeFileNameSafebase64 } from './util/strings';
 import { getRecordingNamePrefix } from './util/recordingName';
 import { JoinParams } from './bots/AbstractMeetBot';
 import config from './config';
-import { spawn } from 'child_process';
 
 /**
- * WebhookUploader: A custom uploader that skips S3 and sends 
- * the file directly to a webhook.
+ * WebhookUploader: A custom uploader for One-Shot delivery.
  */
 class WebhookUploader implements IUploader {
-  private _userId: string;
-  private _tempFileId: string;
-  private _logger: any;
-  private _url: string;
+  private userId: string;
+  private tempFileId: string;
+  private logger: any;
+  private videoUrl: string;
+  public saveDataToTempFile: (chunk: Buffer) => Promise<boolean> = async () => true;
 
-  constructor(userId: string, tempFileId: string, logger: any, url: string) {
-    this._userId = userId;
-    this._tempFileId = tempFileId;
-    this._logger = logger;
-    this._url = url;
+  constructor(userId: string, tempFileId: string, logger: any, videoUrl: string) {
+    this.userId = userId;
+    this.tempFileId = tempFileId;
+    this.logger = logger;
+    this.videoUrl = videoUrl;
   }
 
-  async saveDataToTempFile(data: Buffer): Promise<boolean> {
-      return true;
-  }
+  private async trimSilence(filePath: string): Promise<void> {
+    const trimmedPath = filePath.replace('.webm', '.trimmed.webm');
+    this.logger.info(`[TRIM] Squeezing silence from audio: ${path.basename(filePath)}`);
+    return new Promise((resolve, reject) => {
+      const ffmpegArgs = [
+        '-y', '-i', filePath,
+        '-af', 'silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-35dB'
+      ];
 
-  async uploadRecordingToRemoteStorage(): Promise<boolean> {
-    const webhookUrl = process.env.NOTIFY_WEBHOOK_URL;
-    if (!webhookUrl) {
-      this._logger.error('NOTIFY_WEBHOOK_URL is not set for WebhookUploader');
-      return false;
-    }
+      // STRIP VIDEO IF AUDIO_ONLY IS ENABLED
+      if (process.env.AUDIO_ONLY === 'true') {
+        ffmpegArgs.push('-vn');
+      }
 
-    const fileExt = process.env.AUDIO_ONLY === 'true' ? '.webm' : config.uploaderFileExtension;
-    const filePath = path.join(process.cwd(), 'dist', '_tempvideo', this._userId, `${this._tempFileId}${fileExt}`);
-    
-    if (!fs.existsSync(filePath)) {
-      this._logger.error(`Recording file not found at ${filePath}. Check if AUDIO_ONLY affected extension.`);
-      return false;
-    }
+      ffmpegArgs.push(trimmedPath);
 
-    this._logger.info(`Direct Webhook Upload: Sending ${filePath} to ${webhookUrl}`);
-    
-    const form = new FormData();
-    form.append('recording', fs.createReadStream(filePath));
-    form.append('recordingId', this._tempFileId);
-    form.append('userId', this._userId);
-    form.append('meetingLink', this._url);
-    form.append('timestamp', new Date().toISOString());
-
-    try {
-      const response = await axios.post(webhookUrl, form, {
-        headers: {
-          ...form.getHeaders(),
-          'X-Webhook-Secret': process.env.NOTIFY_WEBHOOK_SECRET || '',
-        },
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-      });
-      this._logger.info('Webhook file delivery successful', { status: response.status });
-      return true;
-    } catch (error: any) {
-      this._logger.error('Webhook file delivery failed', { 
-          message: error.message,
-          response: error.response?.data
-      });
-      return false;
-    }
-  }
-}
-
-// --- ZERO-COLLISION API INTERCEPTION ---
-
-// Monkey-patch the browser context creation to inject the Audio-Only API interceptor
-const originalCreateBrowserContext = (chromiumModule as any).default;
-(chromiumModule as any).default = async function(url: string, correlationId: string, botType: any) {
-  const page = await originalCreateBrowserContext(url, correlationId, botType);
-  
-  if (process.env.AUDIO_ONLY === 'true' && botType !== 'microsoft') {
-    console.log('💉 Injecting Audio-Only API Interceptor into browser context...');
-    await page.addInitScript(() => {
-      // 1. Intercept getDisplayMedia to return an audio-only stream
-      const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
-      
-      (navigator.mediaDevices as any).getDisplayMedia = async (constraints: any) => {
-        console.log('🎬 Bot requested getDisplayMedia. Stripping video tracks for Audio-Only mode...');
-        const stream = await originalGetDisplayMedia(constraints);
-        
-        // Return a stream that only contains the audio tracks
-        const audioOnlyStream = new MediaStream(stream.getAudioTracks());
-        
-        // Stop any captured video tracks immediately to protect privacy and save CPU
-        stream.getVideoTracks().forEach((track: any) => {
-          track.stop();
-          console.log('🚫 Video track stopped immediately.');
-        });
-        
-        return audioOnlyStream;
-      };
-
-      // 2. Intercept MediaRecorder to match the new audio-only stream
-      const OriginalMediaRecorder = window.MediaRecorder;
-      (window as any).MediaRecorder = class extends OriginalMediaRecorder {
-        constructor(stream: MediaStream, options: any) {
-          if (options && options.mimeType && options.mimeType.includes('video')) {
-            console.log(`🎥 MediaRecorder: Overriding ${options.mimeType} with audio/webm because stream is audio-only.`);
-            options.mimeType = 'audio/webm;codecs=opus';
-          }
-          super(stream, options);
+      const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+      ffmpeg.on('close', (code) => {
+        if (code === 0 && fs.existsSync(trimmedPath)) {
+          const originalSize = fs.statSync(filePath).size;
+          const trimmedSize = fs.statSync(trimmedPath).size;
+          const savedPerc = Math.round((1 - trimmedSize / originalSize) * 100);
+          this.logger.info(`[TRIM] Success. Saved ~${savedPerc}% of file size.`);
+          fs.renameSync(trimmedPath, filePath);
+          resolve();
+        } else {
+          this.logger.warn(`[TRIM] Failed or produced no file (code ${code}). Keeping original.`);
+          resolve(); // Resolve anyway to not block upload
         }
-        
-        static isTypeSupported(type: string) {
-          // If we're forcing audio-only, tell the bot that video types aren't supported
-          // so it falls back to common types or our chosen type.
-          if (type.includes('video')) {
-            return false;
-          }
-          return OriginalMediaRecorder.isTypeSupported(type);
-        }
-      };
+      });
+      ffmpeg.on('error', (err) => {
+        this.logger.error(`[TRIM] FFmpeg error: ${err.message}`);
+        resolve();
+      });
     });
   }
 
-  // Apply speed optimizations to the page instance
-  applyTimingOptimizations(page);
+  async uploadRecordingToRemoteStorage(): Promise<boolean> {
+    const notifyUrl = process.env.NOTIFY_WEBHOOK_URL;
+    if (!notifyUrl || notifyUrl.includes('your-api')) return true;
+    try {
+      const filePath = path.join(process.cwd(), 'dist', '_tempvideo', this.userId, `${this.tempFileId}.webm`);
+      if (!fs.existsSync(filePath)) return false;
+
+      // PERFORM SILENCE TRIMMING
+      await this.trimSilence(filePath);
+
+      const form = new FormData();
+      form.append('recording', fs.createReadStream(filePath));
+      form.append('userId', this.userId);
+      form.append('botId', (process.env.DEFAULT_BOT_ID || 'autostart-bot'));
+      form.append('videoUrl', this.videoUrl);
+      await axios.post(notifyUrl, form, {
+        headers: { ...form.getHeaders(), 'x-webhook-secret': (process.env.NOTIFY_WEBHOOK_SECRET || '') },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
+      });
+      return true;
+    } catch (error) { return false; }
+  }
+}
+
+// --- REPO-OWNER COMPATIBILITY & SPEED PATCHES ---
+
+// 1. Force the Timer to stay alive (God-Mode)
+const originalGetWaitingPromise = (promiseModule as any).getWaitingPromise;
+(promiseModule as any).getWaitingPromise = function(ms: number) {
+  const envDuration = parseInt(process.env.MAX_RECORDING_DURATION_MINUTES || '40', 10) * 60 * 1000;
+  if (!ms || ms < 60000) ms = envDuration;
+  return originalGetWaitingPromise(ms);
+};
+
+// 2. Wrap the REPO OWNER'S browser context creation (Keeps their Stealth Plugin)
+const originalCreateBrowserContext = (chromiumModule as any).default;
+(chromiumModule as any).default = async function(url: string, correlationId: string, botType: any) {
+  // We utilize the repo owner's original logic which includes StealthPlugin automatically
+  const page = await originalCreateBrowserContext(url, correlationId, botType);
+  
+  // STEALTH: Remove the Automation Flag and emulate human environment
+  await page.addInitScript(() => {
+    // Hide WebDriver
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // Emulate Languages
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    // Emulate Plugins
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    // Permissions Query Masking
+    const nav: any = navigator;
+    if (nav.permissions && nav.permissions.query) {
+      const originalQuery = nav.permissions.query;
+      nav.permissions.query = (parameters: any) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    }
+  });
+  
+  // SPEED OPTIMIZATION: Overwrite page.waitForTimeout
+  const originalWait = page.waitForTimeout.bind(page);
+  page.waitForTimeout = (ms: number) => {
+    // Shave off the 10-second idle waits to speed up join/admission
+    if (ms === 10000) return originalWait(2000);
+    return originalWait(ms);
+  };
 
   return page;
 };
 
-// 3. Patch FFmpegRecorder (for Teams)
-if (process.env.AUDIO_ONLY === 'true') {
-  console.log('🎙️ Patching FFmpegRecorder for Teams Audio-Only mode...');
-  FFmpegRecorder.prototype.start = async function(): Promise<void> {
-    const self = this as any;
-    return new Promise((resolve, reject) => {
-      try {
-        self.logger.info('[PATCH] Starting FFmpeg in AUDIO-ONLY mode');
-        const ffmpegArgs = [
-          '-y',
-          '-loglevel', 'info',
-          // Only Audio input (PulseAudio)
-          '-f', 'pulse',
-          '-ac', '2',
-          '-ar', '44100',
-          '-i', 'virtual_output.monitor',
-          // Audio encoding
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-ar', '44100',
-          '-ac', '2',
-          self.outputPath // Keep original extension for internal simplicity
-        ];
+// 3. Force FFmpeg to use Clean Audio Only
+const originalFFmpegStart = FFmpegRecorder.prototype.start;
+FFmpegRecorder.prototype.start = async function(): Promise<void> {
+  const self = this as any;
+  if (process.env.AUDIO_ONLY !== 'true') return originalFFmpegStart.apply(this);
 
-        self.ffmpegProcess = spawn('ffmpeg', ffmpegArgs, {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/run/user/1001' }
-        });
+  return new Promise((resolve, reject) => {
+    try {
+      const ffmpegArgs = [
+        '-y', '-loglevel', 'info',
+        '-f', 'pulse', '-ac', '1', '-ar', '48000', '-i', 'virtual_output.monitor',
+        '-c:a', (self.outputPath.endsWith('.webm') ? 'libopus' : 'aac'),
+        '-b:a', '128k', '-ar', '48000', '-ac', '1',
+        self.outputPath
+      ];
+      self.ffmpegProcess = spawn('ffmpeg', ffmpegArgs, { 
+        stdio: ['pipe', 'pipe', 'pipe'], 
+        env: { ...process.env, XDG_RUNTIME_DIR: '/run/user/1001', DISPLAY: ':99' } 
+      });
+      setTimeout(() => resolve(), 2000);
+    } catch (err) { reject(err); }
+  });
+};
 
-        self.ffmpegProcess.on('exit', (code: any) => {
-            if (self.exitCallback) self.exitCallback(code);
-            if (code !== 0) self.logger.error('FFmpeg exited with error', code);
-        });
-
-        setTimeout(() => resolve(), 2000);
-      } catch (e) { reject(e); }
-    });
-  };
-}
-
-/**
- * Optimization Interceptor: Speeds up the bot joining process by 
- * reducing hardcoded safety delays in the main bot class.
- */
-function applyTimingOptimizations(page: any) {
-  // 1. Speed up hardcoded 10-second safety waits (GoogleMeetBot.ts uses these frequently)
-  const originalWaitForTimeout = page.waitForTimeout.bind(page);
-  page.waitForTimeout = (ms: number) => {
-    if (ms === 10000) return originalWaitForTimeout(1500); 
-    return originalWaitForTimeout(ms);
-  };
-
-  // 2. Speed up the 15-second "Got it" button search
-  const originalWaitForSelector = page.waitForSelector.bind(page);
-  page.waitForSelector = (selector: string, options?: any) => {
-    if (options && options.timeout === 15000) options.timeout = 3000;
-    if (options && options.timeout === 10000) options.timeout = 2000;
-    return originalWaitForSelector(selector, options);
-  };
-
-  // 3. Speed up the 20-second Lobby Admission check
-  const originalSetInterval = globalThis.setInterval;
-  (globalThis as any).setInterval = (handler: any, timeout?: number, ...args: any[]) => {
-    if (timeout === 20000) timeout = 4000; // 20s -> 4s
-    return originalSetInterval(handler, timeout, ...args);
-  };
-}
+// 4. Wrap recordMeetingPage for Config Sync
+const originalGoogleMeetRecord = GoogleMeetBot.prototype['recordMeetingPage'];
+(GoogleMeetBot as any).prototype.recordMeetingPage = async function(args: any) {
+  config.maxRecordingDuration = parseInt(process.env.MAX_RECORDING_DURATION_MINUTES || '40', 10);
+  config.inactivityLimit = parseInt(process.env.MEETING_INACTIVITY_MINUTES || '2', 10);
+  config.activateInactivityDetectionAfter = parseInt(process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES || '5', 10);
+  return originalGoogleMeetRecord.apply(this, [args]);
+};
 
 async function run() {
-  // Set safer defaults for silence detection if not provided
-  process.env.MEETING_INACTIVITY_MINUTES = process.env.MEETING_INACTIVITY_MINUTES || '10';
-  process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES = process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES || '5';
-
   const url = process.env.MEETING_URL;
-  if (!url) {
-    console.error('MEETING_URL environment variable is required for autostart');
-    process.exit(1);
-  }
+  if (!url) process.exit(1);
 
-  const userId = process.env.DEFAULT_USER_ID || 'autostart-user';
-  const teamId = process.env.DEFAULT_TEAM_ID || 'autostart-team';
-  const botId = process.env.DEFAULT_BOT_ID || `bot-${Date.now()}`;
-  const eventId = process.env.DEFAULT_EVENT_ID;
-  const name = process.env.DEFAULT_BOT_NAME || 'Meeting Notetaker';
-  const bearerToken = process.env.DEFAULT_BEARER_TOKEN || 'no-token';
-  const timezone = process.env.DEFAULT_TIMEZONE || 'UTC';
+  const userId = (process.env.DEFAULT_USER_ID || 'autostart-user');
+  const teamId = (process.env.DEFAULT_TEAM_ID || 'autostart-team');
+  const botId = (process.env.DEFAULT_BOT_ID || `bot-${Date.now()}`);
+  const eventId = (process.env.DEFAULT_EVENT_ID || undefined);
+  const name = (process.env.DEFAULT_BOT_NAME || 'Meeting Notetaker');
+  const providerRaw = getProvider(url);
+  const provider = (providerRaw as string) as any;
 
-  const provider = getProvider(url);
-  if (!provider) {
-    console.error(`Unsupported platform for URL: ${url}`);
-    process.exit(1);
-    return;
-  }
+  if (!provider) process.exit(1);
 
-  const correlationId = createCorrelationId({ teamId, userId, botId, eventId, url });
+  const correlationId = createCorrelationId({ teamId, userId, botId, url, eventId });
   const logger = loggerFactory(correlationId, provider);
 
-  logger.info('Starting autostart meeting recorder...', { url, provider });
-
   try {
-    const entityId = botId ?? eventId;
-    const tempId = `${userId}${entityId}0`;
-    const tempFileId = encodeFileNameSafebase64(tempId);
+    const tempFileId = encodeFileNameSafebase64(`${userId}${botId}0`);
     const namePrefix = getRecordingNamePrefix(provider);
-
     let uploader: IUploader;
 
     if (process.env.UPLOAD_TO_WEBHOOK === 'true') {
-      logger.info('One-Shot: Using Direct Webhook Uploader');
       uploader = new WebhookUploader(userId, tempFileId, logger, url);
-      
-      // We also need to "tap" into DiskUploader to handle the local writing part
-      const diskWriter = await DiskUploader.initialize(bearerToken, teamId, timezone, userId, botId ?? '', namePrefix, tempFileId, logger, url);
-      
+      const diskWriter = await DiskUploader.initialize('', teamId, 'UTC', userId, botId, namePrefix, tempFileId, logger, url);
       const originalUpload = uploader.uploadRecordingToRemoteStorage.bind(uploader);
       uploader.saveDataToTempFile = diskWriter.saveDataToTempFile.bind(diskWriter);
-      uploader.uploadRecordingToRemoteStorage = async () => {
-          await (diskWriter as any).finalizeDiskWriting();
-          return originalUpload();
-      };
+      uploader.uploadRecordingToRemoteStorage = async () => { await (diskWriter as any).finalizeDiskWriting(); return originalUpload(); };
     } else {
-      uploader = await DiskUploader.initialize(bearerToken, teamId, timezone, userId, botId ?? '', namePrefix, tempFileId, logger, url);
+      uploader = await DiskUploader.initialize('', teamId, 'UTC', userId, botId, namePrefix, tempFileId, logger, url);
     }
 
-    const joinParams: JoinParams = { url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader };
-
+    const joinParams: JoinParams = { url, name, bearerToken: '', teamId, timezone: 'UTC', userId, eventId, botId, uploader };
     switch (provider) {
-      case 'google':
-        await new GoogleMeetBot(logger, correlationId).join(joinParams);
-        break;
-      case 'microsoft':
-        await new MicrosoftTeamsBot(logger, correlationId).join(joinParams);
-        break;
-      case 'zoom':
-        await new ZoomBot(logger, correlationId).join(joinParams);
-        break;
+      case 'google': await new GoogleMeetBot(logger, correlationId).join(joinParams); break;
+      case 'microsoft': await new MicrosoftTeamsBot(logger, correlationId).join(joinParams); break;
+      case 'zoom': await new ZoomBot(logger, correlationId).join(joinParams); break;
     }
-
-    logger.info('Success. Exiting container.');
     process.exit(0);
-  } catch (error) {
-    logger.error('Autostart failed:', error);
-    process.exit(1);
-  }
+  } catch (error) { process.exit(1); }
 }
 
 function getProvider(url: string): 'google' | 'microsoft' | 'zoom' | null {
@@ -293,7 +225,4 @@ function getProvider(url: string): 'google' | 'microsoft' | 'zoom' | null {
   return null;
 }
 
-run().catch(err => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-});
+run().catch(() => process.exit(1));
