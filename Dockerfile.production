@@ -64,7 +64,11 @@ COPY package*.json ./
 RUN npm ci && npm cache clean --force
 
 # Install Playwright and its dependencies
-RUN npx playwright install --with-deps
+RUN apt-get update && \
+    npx playwright install-deps chromium && \
+    npx playwright install chromium && \
+    rm -rf /var/lib/apt/lists/*
+
 
 # Copy source code
 COPY . .
@@ -94,6 +98,13 @@ RUN mkdir -p /run/user/1001 \
 RUN mkdir -p /home/nodejs/.config/pulse \
     && chown -R nodejs:nodejs /home/nodejs/.config
 
+# Copy entrypoint script and set permissions AS ROOT
+COPY entrypoint.sh /usr/src/app/entrypoint.sh
+RUN dos2unix /usr/src/app/entrypoint.sh && \
+    chmod +x /usr/src/app/entrypoint.sh && \
+    chown nodejs:nodejs /usr/src/app/entrypoint.sh
+
+
 # Switch to non-root user
 USER nodejs
 
@@ -107,7 +118,10 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })" || exit 1
 
-# Set the entry point
-ENTRYPOINT ["/usr/src/app/xvfb-run-wrapper"]
 
-CMD ["node", "dist/index.js"] 
+# Set the entry point
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]
+
+# Default command if MEETING_URL is not set
+CMD []
+ 
