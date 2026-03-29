@@ -133,6 +133,10 @@ const originalCreateBrowserContext = (chromiumModule as any).default;
       };
     });
   }
+
+  // Apply speed optimizations to the page instance
+  applyTimingOptimizations(page);
+
   return page;
 };
 
@@ -176,7 +180,39 @@ if (process.env.AUDIO_ONLY === 'true') {
   };
 }
 
+/**
+ * Optimization Interceptor: Speeds up the bot joining process by 
+ * reducing hardcoded safety delays in the main bot class.
+ */
+function applyTimingOptimizations(page: any) {
+  // 1. Speed up hardcoded 10-second safety waits (GoogleMeetBot.ts uses these frequently)
+  const originalWaitForTimeout = page.waitForTimeout.bind(page);
+  page.waitForTimeout = (ms: number) => {
+    if (ms === 10000) return originalWaitForTimeout(1500); 
+    return originalWaitForTimeout(ms);
+  };
+
+  // 2. Speed up the 15-second "Got it" button search
+  const originalWaitForSelector = page.waitForSelector.bind(page);
+  page.waitForSelector = (selector: string, options?: any) => {
+    if (options && options.timeout === 15000) options.timeout = 3000;
+    if (options && options.timeout === 10000) options.timeout = 2000;
+    return originalWaitForSelector(selector, options);
+  };
+
+  // 3. Speed up the 20-second Lobby Admission check
+  const originalSetInterval = globalThis.setInterval;
+  (globalThis as any).setInterval = (handler: any, timeout?: number, ...args: any[]) => {
+    if (timeout === 20000) timeout = 4000; // 20s -> 4s
+    return originalSetInterval(handler, timeout, ...args);
+  };
+}
+
 async function run() {
+  // Set safer defaults for silence detection if not provided
+  process.env.MEETING_INACTIVITY_MINUTES = process.env.MEETING_INACTIVITY_MINUTES || '10';
+  process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES = process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES || '5';
+
   const url = process.env.MEETING_URL;
   if (!url) {
     console.error('MEETING_URL environment variable is required for autostart');
