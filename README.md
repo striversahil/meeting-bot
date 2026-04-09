@@ -11,6 +11,7 @@ An open-source automation bot for joining and recording video meetings across mu
 
 - **Multi-Platform Support**: Join meetings on Google Meet, Microsoft Teams, and Zoom
 - **Automated Recording**: Capture meeting recordings with configurable duration limits
+- **Audio-Only Mode**: Optimized low-CPU audio recording that runs on just **1 vCPU** — [see details](AUDIO_ONLY_OPTIMIZATION.md)
 - **Single Job Execution**: Ensures only one meeting is processed at a time across the entire system
 - **Dual Integration Options**: RESTful API endpoints and Redis message queue for flexible integration
 - **Asynchronous Processing**: Redis queue support for high-throughput, scalable meeting requests
@@ -19,6 +20,29 @@ An open-source automation bot for joining and recording video meetings across mu
 - **Prometheus Metrics**: Built-in monitoring and metrics collection
 - **Stealth Mode**: Advanced browser automation with anti-detection measures
 - **Completion Notifications**: Optional webhook and Redis notifications when a recording is completed
+
+## 🎙️ Audio-Only Mode
+
+For use cases that only need audio (transcription, meeting notes, voice analytics), the bot supports an optimized **Audio-Only mode** that dramatically reduces CPU requirements.
+
+| Mode | Min vCPU | Min RAM | Audio Quality |
+|---|---|---|---|
+| Default (video + audio) | 4 | 4 GB | Good |
+| **Audio-Only** | **1** | **2 GB** | **Excellent** |
+
+Enable it by setting `AUDIO_ONLY=true`:
+
+```bash
+docker run -it --rm \
+  --cpus="1" --memory="2g" \
+  -e MEETING_URL="https://meet.google.com/xxx-xxxx-xxx" \
+  -e AUDIO_ONLY=true \
+  -e UPLOAD_TO_WEBHOOK=true \
+  -e NOTIFY_WEBHOOK_URL="https://your-webhook.com/endpoint" \
+  meeting-bot-production
+```
+
+This mode uses raw PCM capture from PulseAudio instead of real-time browser encoding, reducing recording CPU overhead from ~80% to ~2%. See [AUDIO_ONLY_OPTIMIZATION.md](AUDIO_ONLY_OPTIMIZATION.md) for the full technical breakdown.
 
 ## 🚀 Quick Start
 
@@ -453,6 +477,8 @@ Notes:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `AUDIO_ONLY` | Enable optimized audio-only recording mode (1 vCPU capable) | `false` |
+| `UPLOAD_TO_WEBHOOK` | Upload recording file to webhook instead of S3/Azure | `false` |
 | `MAX_RECORDING_DURATION_MINUTES` | Maximum recording duration in minutes | `180` |
 | `MEETING_INACTIVITY_MINUTES` | Continuous inactivity duration after which the bot will end meeting recording | `1` |
 | `INACTIVITY_DETECTION_START_DELAY_MINUTES` | Initial grace period at the start of recording before inactivity detection begins | `1` |

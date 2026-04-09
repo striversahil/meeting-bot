@@ -66,7 +66,8 @@ async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeou
 }
 
 async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google'): Promise<Page> {
-  const size = { width: 1280, height: 720 };
+  const isAudioOnly = process.env.AUDIO_ONLY === 'true';
+  const size = isAudioOnly ? { width: 800, height: 600 } : { width: 1280, height: 720 };
 
   // Base browser args used by all bots
   const baseBrowserArgs: string[] = [
@@ -75,13 +76,32 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-web-security',
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
     `--window-size=${size.width},${size.height}`,
     '--auto-accept-this-tab-capture',
     '--enable-features=MediaRecorder',
     '--enable-audio-service-out-of-process',
     '--autoplay-policy=no-user-gesture-required',
+  ];
+
+  // AUDIO_ONLY: Aggressively reduce Chrome's CPU usage so audio pipeline doesn't stutter.
+  // SwiftShader (software GPU) and image rendering are the biggest CPU hogs.
+  const audioOnlyArgs: string[] = isAudioOnly ? [
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-gpu-compositing',
+    '--disable-accelerated-2d-canvas',
+    '--disable-dev-shm-usage',
+    '--disable-background-networking',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-sync',
+    '--disable-translate',
+    '--disable-background-timer-throttling',
+    '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+  ] : [
+    '--use-gl=angle',
+    '--use-angle=swiftshader',
   ];
 
   // Fake device args - only for Microsoft Teams
@@ -97,8 +117,8 @@ async function createBrowserContext(url: string, correlationId: string, botType:
   // - Google Meet: clicks "Continue without microphone and camera"
   // - Zoom: expects "Cannot detect your camera/microphone" notifications
   const browserArgs = botType === 'microsoft'
-    ? [...baseBrowserArgs, ...fakeDeviceArgs]
-    : baseBrowserArgs;
+    ? [...baseBrowserArgs, ...audioOnlyArgs, ...fakeDeviceArgs]
+    : [...baseBrowserArgs, ...audioOnlyArgs];
 
   // Teams-specific display args: kiosk mode prevents address bar from showing in ffmpeg recording
   // Google Meet and Zoom don't need this since they use tab capture (getDisplayMedia)

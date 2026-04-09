@@ -25,6 +25,7 @@ class WebhookUploader implements IUploader {
   private tempFileId: string;
   private logger: any;
   private videoUrl: string;
+  public skipTrimSilence: boolean = false;
   public saveDataToTempFile: (chunk: Buffer) => Promise<boolean> = async () => true;
 
   constructor(userId: string, tempFileId: string, logger: any, videoUrl: string) {
@@ -40,7 +41,8 @@ class WebhookUploader implements IUploader {
     return new Promise((resolve, reject) => {
       const ffmpegArgs = [
         '-y', '-i', filePath,
-        '-af', 'silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-35dB'
+        '-af', 'silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB',
+        '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '1'
       ];
 
       // STRIP VIDEO IF AUDIO_ONLY IS ENABLED
@@ -78,8 +80,12 @@ class WebhookUploader implements IUploader {
       const filePath = path.join(process.cwd(), 'dist', '_tempvideo', this.userId, `${this.tempFileId}.webm`);
       if (!fs.existsSync(filePath)) return false;
 
-      // PERFORM SILENCE TRIMMING
-      await this.trimSilence(filePath);
+      // PERFORM SILENCE TRIMMING (skip if raw capture already handled it)
+      if (!this.skipTrimSilence) {
+        await this.trimSilence(filePath);
+      } else {
+        this.logger.info('[TRIM] Skipped — raw capture already applied silence removal');
+      }
 
       const form = new FormData();
       form.append('recording', fs.createReadStream(filePath));
@@ -208,6 +214,112 @@ async function run() {
       uploader = await DiskUploader.initialize('', teamId, 'UTC', userId, botId, namePrefix, tempFileId, logger, url);
     }
 
+    // --- RAW AUDIO CAPTURE MODE (AUDIO_ONLY) ---
+    // Instead of encoding in real-time (Chrome MediaRecorder → Opus → IPC → Node.js → disk),
+    // we capture raw PCM directly from PulseAudio with ZERO encoding CPU.
+    // After the meeting, we do a single-pass FFmpeg encode + silence removal.
+    let rawCaptureProcess: ReturnType<typeof spawn> | null = null;
+    const rawFilePath = path.join(process.cwd(), 'dist', '_tempvideo', userId, `${tempFileId}.wav`);
+    const webmFilePath = path.join(process.cwd(), 'dist', '_tempvideo', userId, `${tempFileId}.webm`);
+
+    if (process.env.AUDIO_ONLY === 'true') {
+      // Ensure output directory exists
+      fs.mkdirSync(path.dirname(rawFilePath), { recursive: true });
+
+      // Start raw PCM capture from PulseAudio's virtual sink monitor.
+      // pcm_s16le = raw 16-bit samples, no compression, no CPU.
+      rawCaptureProcess = spawn('ffmpeg', [
+        '-y',
+        '-f', 'pulse',
+        '-ac', '1',
+        '-ar', '48000',
+        '-i', 'virtual_output.monitor',
+        '-c:a', 'pcm_s16le',
+        rawFilePath
+      ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, XDG_RUNTIME_DIR: '/run/user/1001', DISPLAY: ':99' }
+      });
+
+      rawCaptureProcess.on('error', (err) => {
+        logger.error('[RAW CAPTURE] FFmpeg error:', err.message);
+      });
+
+      logger.info('[RAW CAPTURE] Started zero-CPU raw PCM capture from PulseAudio');
+
+      // No-op saveDataToTempFile — raw capture writes directly to disk
+      uploader.saveDataToTempFile = async () => true;
+
+      // Wrap the upload chain to: stop capture → convert raw→webm → upload
+      const existingUpload = uploader.uploadRecordingToRemoteStorage.bind(uploader);
+      uploader.uploadRecordingToRemoteStorage = async () => {
+        // 1. Stop the raw capture gracefully
+        if (rawCaptureProcess && !rawCaptureProcess.killed) {
+          logger.info('[RAW CAPTURE] Stopping raw capture...');
+          try {
+            rawCaptureProcess.stdin?.write('q\n');
+            rawCaptureProcess.stdin?.end();
+          } catch {
+            rawCaptureProcess.kill('SIGTERM');
+          }
+          await new Promise(r => setTimeout(r, 3000));
+          if (!rawCaptureProcess.killed) rawCaptureProcess.kill('SIGKILL');
+        }
+
+        // 2. Convert raw WAV → WebM/Opus with silence removal in ONE pass
+        if (fs.existsSync(rawFilePath)) {
+          const rawSize = fs.statSync(rawFilePath).size;
+          logger.info(`[RAW CAPTURE] Converting ${(rawSize / 1024 / 1024).toFixed(1)}MB raw audio → WebM/Opus`);
+
+          await new Promise<void>((resolve, reject) => {
+            const convertProcess = spawn('ffmpeg', [
+              '-y', '-i', rawFilePath,
+              '-af', 'silenceremove=stop_periods=-1:stop_duration=1.5:stop_threshold=-45dB',
+              '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '1',
+              '-vn',
+              webmFilePath
+            ]);
+
+            convertProcess.stderr?.on('data', (data: Buffer) => {
+              const output = data.toString();
+              if (output.includes('error') || output.includes('Error')) {
+                logger.error('[RAW CAPTURE] Convert error:', output);
+              }
+            });
+
+            convertProcess.on('close', (code) => {
+              if (code === 0 && fs.existsSync(webmFilePath)) {
+                const webmSize = fs.statSync(webmFilePath).size;
+                const ratio = Math.round((1 - webmSize / rawSize) * 100);
+                logger.info(`[RAW CAPTURE] Conversion done. ${(webmSize / 1024).toFixed(0)}KB (${ratio}% compression)`);
+                // Clean up the large raw file
+                try { fs.unlinkSync(rawFilePath); } catch {}
+                resolve();
+              } else {
+                logger.error(`[RAW CAPTURE] Conversion failed with code ${code}`);
+                reject(new Error(`FFmpeg conversion failed: ${code}`));
+              }
+            });
+
+            convertProcess.on('error', (err) => {
+              logger.error('[RAW CAPTURE] Convert process error:', err.message);
+              reject(err);
+            });
+          });
+
+          // The webm file is now at the expected path. Call the existing upload chain.
+          // Mark skipTrimSilence since we already did silence removal during conversion.
+          if ((uploader as any).skipTrimSilence !== undefined) {
+            (uploader as any).skipTrimSilence = true;
+          }
+          return existingUpload();
+        } else {
+          logger.warn('[RAW CAPTURE] No raw file found, falling back to existing upload');
+          return existingUpload();
+        }
+      };
+    }
+
     const joinParams: JoinParams = { url, name, bearerToken: '', teamId, timezone: 'UTC', userId, eventId, botId, uploader };
     switch (provider) {
       case 'google': await new GoogleMeetBot(logger, correlationId).join(joinParams); break;
@@ -216,6 +328,7 @@ async function run() {
     }
     process.exit(0);
   } catch (error) { process.exit(1); }
+
 }
 
 function getProvider(url: string): 'google' | 'microsoft' | 'zoom' | null {

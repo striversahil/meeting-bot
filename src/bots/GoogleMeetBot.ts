@@ -515,14 +515,19 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType }: 
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string }) => {
+      async ({ teamId, duration, inactivityLimit, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType, isAudioOnly }: 
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string, isAudioOnly: boolean }) => {
+        (window as any).AUDIO_ONLY_ENABLED = isAudioOnly;
         let timeoutId: NodeJS.Timeout;
         let inactivityParticipantDetectionTimeout: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
 
         const sendChunkToServer = async (chunk: ArrayBuffer) => {
+          // In AUDIO_ONLY mode, raw PulseAudio capture handles recording on the host.
+          // Skip the expensive base64 encoding + IPC to save CPU.
+          if ((window as any).AUDIO_ONLY_ENABLED === true) return;
+
           function arrayBufferToBase64(buffer: ArrayBuffer) {
             let binary = '';
             const bytes = new Uint8Array(buffer);
@@ -544,17 +549,26 @@ export class GoogleMeetBot extends MeetBotBase {
             return;
           }
           
+          const isAudioOnly = (window as any).AUDIO_ONLY_ENABLED === true;
           const stream: MediaStream = await (navigator.mediaDevices as any).getDisplayMedia({
-            video: true,
+            video: isAudioOnly ? { frameRate: 1, width: 320, height: 240 } : true,
             audio: {
               autoGainControl: false,
-              channels: 2,
-              channelCount: 2,
+              channels: 1,
+              channelCount: 1,
               echoCancellation: false,
               noiseSuppression: false,
+              sampleRate: 48000,
             },
             preferCurrentTab: true,
           });
+
+          // In audio-only mode, drop video tracks to save CPU on encoding
+          if (isAudioOnly) {
+            stream.getVideoTracks().forEach(track => track.stop());
+            stream.getVideoTracks().forEach(track => stream.removeTrack(track));
+            console.log('AUDIO_ONLY: Dropped video tracks from stream to save CPU');
+          }
 
           // Check if we actually got audio tracks
           const audioTracks = stream.getAudioTracks();
@@ -565,7 +579,16 @@ export class GoogleMeetBot extends MeetBotBase {
           }
 
           let options: MediaRecorderOptions = {};
-          if (MediaRecorder.isTypeSupported(primaryMimeType)) {
+          if (isAudioOnly) {
+            // Use audio-only codec to avoid video encoding overhead
+            const audioOnlyMime = 'audio/webm;codecs=opus';
+            if (MediaRecorder.isTypeSupported(audioOnlyMime)) {
+              console.log(`Media Recorder will use audio-only codec: ${audioOnlyMime}`);
+              options = { mimeType: audioOnlyMime };
+            } else {
+              console.warn('audio/webm;codecs=opus not supported, falling back to default');
+            }
+          } else if (MediaRecorder.isTypeSupported(primaryMimeType)) {
             console.log(`Media Recorder will use ${primaryMimeType} codecs...`);
             options = { mimeType: primaryMimeType };
           }
@@ -575,6 +598,7 @@ export class GoogleMeetBot extends MeetBotBase {
           }
 
           const mediaRecorder = new MediaRecorder(stream, { ...options });
+
 
           mediaRecorder.ondataavailable = async (event: BlobEvent) => {
             if (!event.data.size) {
@@ -1023,7 +1047,8 @@ export class GoogleMeetBot extends MeetBotBase {
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
         primaryMimeType: webmMimeType,
-        secondaryMimeType: vp9MimeType
+        secondaryMimeType: vp9MimeType,
+        isAudioOnly: process.env.AUDIO_ONLY === 'true'
       }
     );
   

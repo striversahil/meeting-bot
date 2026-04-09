@@ -36,8 +36,8 @@ export class FFmpegRecorder {
 
           // Audio input from PulseAudio monitor
           '-f', 'pulse',
-          '-ac', '2',
-          '-ar', '44100',
+          '-ac', '1',
+          '-ar', '48000',
           '-i', 'virtual_output.monitor',
 
           // Video encoding with better compatibility
@@ -51,8 +51,8 @@ export class FFmpegRecorder {
           // Audio encoding
           '-c:a', 'aac',
           '-b:a', '128k',
-          '-ar', '44100',
-          '-ac', '2',
+          '-ar', '48000',
+          '-ac', '1',
           '-strict', 'experimental',
 
           // Sync and timing

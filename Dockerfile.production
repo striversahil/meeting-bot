@@ -98,6 +98,9 @@ RUN mkdir -p /run/user/1001 \
 RUN mkdir -p /home/nodejs/.config/pulse \
     && chown -R nodejs:nodejs /home/nodejs/.config
 
+# Copy custom PulseAudio configuration
+COPY --chown=nodejs:nodejs pulse-daemon.conf /home/nodejs/.config/pulse/daemon.conf
+
 # Copy entrypoint script and set permissions AS ROOT
 COPY entrypoint.sh /usr/src/app/entrypoint.sh
 RUN dos2unix /usr/src/app/entrypoint.sh && \
